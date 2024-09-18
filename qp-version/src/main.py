@@ -26,6 +26,7 @@ sends out type 30002 which should be routed to TS.
 """
 import os
 import json
+import logging
 from mdclogpy import Logger
 from ricxappframe.xapp_frame import RMRXapp, rmr
 from prediction import forecast
@@ -64,11 +65,16 @@ def qp_predict_handler(self, summary, sbuf):
     Function that processes messages for type 30000
     """
     logger.debug("predict handler received payload {}".format(summary[rmr.RMR_MS_PAYLOAD]))
+    print("step 0")
     pred_msg = predict(summary[rmr.RMR_MS_PAYLOAD])
+    print("step 1")
     self.predict_requests += 1
+    print("step 2")
     # we don't use rts here; free this
     self.rmr_free(sbuf)
+    print("step 3")
     success = self.rmr_send(pred_msg.encode(), 30002)
+    print("step 4")
     logger.debug("Sending message to ts : {}".format(pred_msg))  # For debug purpose
     if success:
         logger.debug("predict handler: sent message successfully")
@@ -89,14 +95,126 @@ def cells(ue):
         cells = srvc+nbc
     return cells
 
-
-def predict(payload):
+def sanitize_payload(payload):
     """
-     Function that forecast the time series
+    Sanitize and correct common formatting issues in the payload.
+    """
+    try:
+        # Remove leading and trailing whitespace
+        payload = payload.strip()
+
+        if payload.startswith('['):
+            if not payload.endswith(']'):
+                payload = payload.rstrip(',') + ']'
+        
+        # Handle case where payload might end with incomplete JSON structures
+        if payload.endswith(','):
+            payload = payload.rstrip(',')
+        
+        # Balance the brackets
+        open_braces = payload.count('{')
+        close_braces = payload.count('}')
+
+        payload += ']'  # Add a closing bracket to ensure valid JSON
+
+        if open_braces > close_braces:
+            payload += '}' * (open_braces - close_braces)
+        
+        open_brackets = payload.count('[')
+        close_brackets = payload.count(']')
+        if open_brackets > close_brackets:
+            payload += ']' * (open_brackets - close_brackets)
+        
+        # Ensure the payload ends with the correct character if it's an array
+        if payload.startswith('[') and not payload.endswith(']'):
+            payload += ']'
+        
+        # Ensure the payload ends with the correct character if it's an object
+        if payload.startswith('{') and not payload.endswith('}'):
+            payload += '}'
+        
+        # Validate JSON structure  
+        try:
+            json.loads(payload)  # Attempt to parse JSON to validate
+        except json.JSONDecodeError:
+            logging.error("Sanitized payload is still invalid JSON")
+            return payload
+        
+        return payload
+    
+    except Exception as e:
+        logging.error(f"Error sanitizing payload: {e}")
+        return payload
+
+def process_chunk(chunk):
+    """
+    Process a chunk of the payload and return predictions.
     """
     output = {}
-    payload = json.loads(payload)
-    ue_list = payload['UEPredictionSet']
+    print("chunk: ", chunk)
+    for ueid in chunk:
+        tp = {}
+        cell_list = cells(ueid)
+        for cid in cell_list:
+            train_model(cid)
+            mcid = cid.replace('/', '')
+            db.read_data(cellid=cid, limit=101)
+            if db.data is not None and len(db.data) != 0:
+                try:
+                    inp = db.data[db.thptparam]
+                except DataNotMatchError:
+                    logger.debug("UL/DL parameters do not exist in provided data")
+                df_f = forecast(inp, mcid, 1)
+                if df_f is not None:
+                    tp[cid] = df_f.values.tolist()[0]
+                    df_f[db.cid] = cid
+                    db.write_prediction(df_f)
+                else:
+                    tp[cid] = [None, None]
+        output[ueid] = tp
+    return output
+
+def predict(payload, chunk_size=10000):
+    """
+    Function that forecasts the time series.
+    Handles large payloads by processing in chunks.
+    """
+    output = {}
+
+    try:
+        # Decode bytes if necessary
+        if isinstance(payload, bytes):
+            payload = payload.decode('utf-8')
+        
+        print("step 5")
+        payload = payload.strip()  # Strip any leading or trailing whitespace
+
+        print("step 6")
+        # Sanitize payload
+        # wait until the sanitize_payload function is implemented
+
+        payload = sanitize_payload(payload)
+        
+        print("step 7")
+          
+        # Validate payload structure
+        # if not payload.startswith('{') or not payload.endswith('}'):
+        #     logging.error(f"Invalid JSON payload structure: {payload[:2048]}")
+        #     return json.dumps({"error": "Invalid JSON payload"})
+
+        # Parse JSON payload
+        payload = json.loads(payload)
+        
+    except json.JSONDecodeError as e:
+        logging.error(f"JSONDecodeError: {e} with payload snippet: {payload[:2048]}")
+        return json.dumps({"error": "Invalid JSON payload"})
+    except Exception as e:
+        logging.error(f"Error decoding payload: {e}")
+        return json.dumps({"error": "Error processing payload"})
+    
+    ue_list = payload.get('UEPredictionSet', [])
+    print("ue_list: ", ue_list)
+     
     for ueid in ue_list:
         tp = {}
         cell_list = cells(ueid)
@@ -118,6 +236,40 @@ def predict(payload):
                     tp[cid] = [None, None]
         output[ueid] = tp
     return json.dumps(output)
+
+# def predict(payload):
+#     """
+#     Function that forecast the time series
+#     """
+#     output = {}
+#     try:
+#         payload = json.loads(payload)
+#     except json.JSONDecodeError as e:
+#         logging.error(f"JSONDecodeError: {e}")
+#         return json.dumps({"error": "Invalid JSON payload"})
+    
+#     ue_list = payload.get('UEPredictionSet', [])
+#     for ueid in ue_list:
+#         tp = {}
+#         cell_list = cells(ueid)
+#         for cid in cell_list:
+#             train_model(cid)
+#             mcid = cid.replace('/', '')
+#             db.read_data(cellid=cid, limit=101)
+#             if db.data is not None and len(db.data) != 0:
+#                 try:
+#                     inp = db.data[db.thptparam]
+#                 except DataNotMatchError:
+#                     logger.debug("UL/DL parameters do not exist in provided data")
+#                 df_f = forecast(inp, mcid, 1)
+#                 if df_f is not None:
+#                     tp[cid] = df_f.values.tolist()[0]
+#                     df_f[db.cid] = cid
+#                     db.write_prediction(df_f)
+#                 else:
+#                     tp[cid] = [None, None]
+#         output[ueid] = tp
+#     return json.dumps(output)
 
 
 def train_model(cid):
